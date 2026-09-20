@@ -1,0 +1,13 @@
+node_modules/
+lib/
+*.log
+.DS_Store
+.env
+.opencode/
+.trae/
+.soloncode/
+.workbuddy/
+.agents
+PLAN.md
+.arts
+.codeartsdoer
