@@ -24,9 +24,9 @@ import {
   resolveDshHome,
   validateConfig,
 } from './config.js'
-import { registerApiGate, type ApiProxyLike, type RouteRegistrar } from './gate.js'
+import { registerApiGate, type ConnectionFetchRoutes, type GatewayInvoke } from './gate.js'
 import { hijackEventUpgrades, wrapEventStreams, type EventsStreams } from './events-ws.js'
-import { registerCasRoutes } from './http.js'
+import { registerCasRoutes, type RouteRegistrar } from './http.js'
 import { StateStore } from './store.js'
 import type { CasConfig, PluginConfig, ResolvedCasConfig } from './types.js'
 
@@ -170,46 +170,68 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }
 
   if (effectiveConfig.enforce && configValid) {
-    const filterCtx = { store, auth, log }
-    const authView = { auth, secret, isRevoked: (jti: string) => revocations.has(jti) }
-
-    const setupGate = (apiProxy: ApiProxyLike): void => {
+    // 广播等待 connection fetch 路由与 typert gateway 就绪后再接管 /api/session/*。
+    // 旧架构的 `apiProxy` 已废弃（ctx.get('apiProxy') 恒为 undefined），改走
+    // `connection.fetch.register` + `ctx.typertGateway.invoke`。
+    ctx.inject(['connection', 'typertGateway'], (injectedCtx) => {
+      const injected = injectedCtx as unknown as {
+        connection?: { fetch?: ConnectionFetchRoutes }
+        typertGateway?: GatewayInvoke
+      }
+      // harness 里 `ctx.connection` 是 HostConnectionHandle，含 `.rpc`/`.fetch`
+      // 两个 getter；exact 路由注册在 `ctx.connection.fetch.register`。
+      const connFetch = injected.connection?.fetch
+      const gateway = injected.typertGateway
+      if (connFetch === undefined || gateway === undefined) {
+        log('connection.fetch / typertGateway 未就绪，会话隔离未启用（CAS 登录仍可用）')
+        return
+      }
       const gate = registerApiGate({
         config: effectiveConfig,
         auth,
         store,
-        api: apiProxy,
+        gateway,
         isRevoked: jti => revocations.has(jti),
         secret,
         log,
-      }, register)
+      }, connFetch)
       ctx.effect(() => gate.dispose, 'dsh-cas: api gate')
-      log(`已接管 ${gate.methods.length} 个 /api 方法`)
+      log(`已接管 ${gate.methods.length} 个 /api/session/* 方法`)
+    })
 
-      if (apiProxy.events !== undefined) {
-        ctx.effect(() => wrapEventStreams(filterCtx, apiProxy.events as EventsStreams), 'dsh-cas: event streams')
-      }
-    }
+    /* ── 实时事件流（WebSocket）隔离 ── */
+    // 侧边栏由 events.mux / events.host 实时驱动，harness 全量广播，必须逐帧按
+    // owner 过滤，否则切换 CAS 用户后仍能实时看到他人会话。
+    const filterCtx = { store, auth, log }
+    const authView = { auth, secret, isRevoked: (jti: string) => revocations.has(jti) }
 
-    const existing = ctx.get('apiProxy') as ApiProxyLike | undefined
-    if (existing !== undefined) {
-      setupGate(existing)
-    } else {
-      ctx.inject(['apiProxy'], apiCtx => {
-        const api = (apiCtx as unknown as { apiProxy?: ApiProxyLike }).apiProxy
-        if (api === undefined) {
-          log('apiProxy 注入回调中仍不可用，会话隔离未启用（CAS 登录仍可用）')
-          return
-        }
-        setupGate(api)
-      })
-    }
-
+    // 升级拦截：webServer.server 未就绪时 hijackEventUpgrades 内部判空并跳过（打日志）。
     const disposeHijack = hijackEventUpgrades(
       { ...filterCtx, authView },
       webServer as unknown as { server?: import('node:http').Server },
     )
     ctx.effect(() => disposeHijack, 'dsh-cas: websocket upgrades')
+
+    // 包装 apiProxy.events.*：必须在浏览器建连前安装（apply 时窗口期内无已登录连接）。
+    const setupEvents = (events: EventsStreams): void => {
+      const dispose = wrapEventStreams(filterCtx, events)
+      ctx.effect(() => dispose, 'dsh-cas: event streams')
+    }
+    const apiProxyNow = ctx.get('apiProxy') as { events?: EventsStreams } | undefined
+    if (apiProxyNow?.events !== undefined) {
+      setupEvents(apiProxyNow.events)
+    } else {
+      // 取 apiProxy 必须用 inject 兜底：本插件只 inject webServer，apply 时 apiProxy
+      // 常未构造、ctx.get 返回 undefined（表现为「时好时坏」）。
+      ctx.inject(['apiProxy'], (apiCtx) => {
+        const ap = (apiCtx as unknown as { apiProxy?: { events?: EventsStreams } }).apiProxy
+        if (ap?.events === undefined) {
+          log('apiProxy.events 不可用，实时事件流隔离未启用（列表层仍过滤）')
+          return
+        }
+        setupEvents(ap.events)
+      })
+    }
   }
 
   // 登录遮罩：注入在 <body> 起始处，应用脚本之前。

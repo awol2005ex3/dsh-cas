@@ -27,7 +27,6 @@ import { claimSubagentChild, hostPredicate, muxPredicate, type StreamFrame } fro
 import type { StateStore } from './store.js'
 import type { ResolvedAuthConfig, SessionPrincipal } from './types.js'
 
-
 /** 事件流的 WebSocket 升级路径（与 harness `api-path.ts` 一致）。 */
 const MUX_PATH = '/api/events.mux'
 const HOST_PATH = '/api/events.host'
@@ -133,7 +132,6 @@ export function wrapEventStreams(ctx: FrameFilterContext, events: EventsStreams)
 
   const wrapStream = (
     original: EventsStreams['mux'],
-    makeFilter: (principal: SessionPrincipal) => ConnectionFilter,
   ): EventsStreams['mux'] => {
     // async generator：调用方（downlink 的 pump 与本插件的 HTTP SSE 兜底）按
     // AsyncIterable 消费，形状不变。
@@ -151,13 +149,8 @@ export function wrapEventStreams(ctx: FrameFilterContext, events: EventsStreams)
     }
   }
 
-  events.mux = wrapStream(originalMux, principal => ({
-    filterFrame: frame => muxPredicate(ctx, principal)(frame.payload),
-  }))
-  events.host = wrapStream(originalHost, principal => ({
-    filterFrame: frame => hostPredicate(ctx, principal)(frame.payload),
-    beforeFilter: frame => claimSubagentChild(ctx, frame),
-  }))
+  events.mux = wrapStream(originalMux)
+  events.host = wrapStream(originalHost)
   ctx.log('已包装事件流上游：WebSocket 实时帧将按登录态过滤')
 
   return () => {

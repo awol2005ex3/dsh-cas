@@ -130,6 +130,23 @@ export function principalFromRequest(
   })
 }
 
+/**
+ * 从标准 `Request`（`connection.fetch` 路由）解析登录主体；无效返回 undefined。
+ * fetch 路由拿不到原生 IncomingMessage，改从 `request.headers` 取 Cookie。
+ */
+export function principalFromFetch(
+  request: Request,
+  ctx: AuthLookup,
+): SessionPrincipal | undefined {
+  const token = readCookie(request.headers.get('cookie') ?? undefined, ctx.auth.cookieName)
+  if (token === undefined) return undefined
+  return verifyToken(token, {
+    auth: ctx.auth,
+    secret: ctx.secret,
+    revoked: ctx.isRevoked,
+  })
+}
+
 function setSessionCookie(res: ServerResponse, ctx: RouteContext, token: string, maxAge: number): void {
   res.setHeader(
     'Set-Cookie',
