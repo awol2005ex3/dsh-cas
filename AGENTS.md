@@ -4,8 +4,8 @@
 
 ## 项目事实（不可臆造）
 
-- 宿主半入口 `src/index.ts`：插件 id `dsh-cas`，`inject = ['webServer', 'settings']`；`apiProxy` 用 `ctx.get` 延迟获取，未就绪时不阻止加载。
-- 插件配置来自 `ctx.settings` 命名空间 `cas`（`~/.dsh/settings.yaml` 的 `cas:` 段，经 schemastery Config 校验），外挂 patch config 作为 `base` 叠加；`validateConfig` 失败时**降级仅路由模式**，不抛异常（可用页面配置面板补全后重启）。
+- 宿主半入口 `src/index.ts`：插件 id `dsh-cas`，`inject = ['webServer']`；connection/typertGateway/apiProxy 均用 `ctx.get` + `ctx.inject` 延迟获取，未就绪时不阻止加载。
+- 插件配置来自 profile 条目 `id: cas` 的 `config`（**不再有 `settings.yaml` 段、不再有 `ctx.settings.register()`**）；`Config` 顶层字段标 `.volatile()`，读取经 `readCasSettings()` 解包，改写热生效（`loader/volatile-update` → 重装 `start()`）。
 - 浏览器半 `src/client.ts`：构建产物 `lib/client.js` 由 `scripts/wrap-client.mjs` 包上闭包工厂外壳（banner/intro/footer 与 harness `packages/client/tsdown.client.ts` 契约一致）。**client.ts 刻意无 import、无 ESM 语法**，所需类型在文件内重复声明。
 - 插件 API 契约来自 harness/cordis：`ctx.webServer.register`、`ctx.webServer.tapIndex`、`ctx.apiProxy`、`ctx.effect`、`ctx.inject`。**禁止臆造任何未在 SKILL.md 中出现的宿主 API**。
 - 0.1.5 起 `connection.rpc.handle` 对 out-of-tree 插件回归失效；新增 RPC 端点用 `connection.fetch.register()`，本插件当前未使用，如需要再评估。
@@ -20,7 +20,7 @@
 4. **WS 事件流隔离**（`src/events-ws.ts`）：浏览器的 `events.mux`/`events.host` 是 WebSocket 升级（GET + `Upgrade: websocket`），HTTP 路由不参与升级分发。用 `hijackEventUpgrades` 摘掉 http server 的 upgrade 监听器换成包装（登录态校验 + AsyncLocalStorage 帧过滤器），再 `wrapEventStreams` 包装 `apiProxy.events.mux/host` 逐帧过滤。**不与 connection 插件抢 `registerUpgrade`**（同路径重复注册抛错）。
 5. **错误信封**：`RpcError` 是闭合判别联合，没有 `unauthorized`/`forbidden`；业务拒绝一律 HTTP 200 + `{ ok: false, error: { code: 'bad-request', message, details: { issues: [] } } }`，不要用 `internal`（部分客户端会重试）。
 6. **域映射查表**：方法前缀 → `apiProxy` 域名的映射不规则（`session→sessions`、`agentPreset→agentPresets`、`goal→goals`），见 `src/gate.ts` 的 `DOMAIN_OF`；切分用 `method.lastIndexOf('.')`。
-7. **配置经 `ctx.settings` 命名空间读取**：harness 不会把 `~/.dsh/settings.yaml` 的段自动折进 `apply(ctx, config)` 的 config 参数——必须 `inject = ['settings']` 并 `ctx.settings.register('cas', Config, { applies: 'restart', base: config })` + `scope.get()` 读（dsh-wecom 同款）。`register` 抛错（命名空间已注册等）时回退 patch config。`applies: 'restart'` 表明配置改动需重启生效，不要臆造 `live`。
+7. **配置载体（dsh ≥ 0.1.7 已变）**：`ctx.settings.register()` **已不存在**（新的 `SettingsForms` 只有 `describe/update/mutate/configure`）。插件配置 = 「插件 `Config` schema + profile 条目 `id: cas` 上的 `config`」；旧的 `~/.dsh/settings.yaml` 由宿主一次性改名 `.imported` 并把各段并入对应条目。`Config` 的顶层字段必须标 `.volatile()` 才会进设置表单、且改写时 loader 只把新值提交进运行中的 volatile 引用（`Entry._commitVolatile`）并在插件 ctx 上广播 `loader/volatile-update`——**不重挂插件**。因此读取配置一律经 `readCasSettings(config)` 解包 `Volatile<T>` 引用（`MaybeVolatile` 兼容旧 dsh 的普通值），**禁止在 apply 时缓存解包结果**；`apply` 内所有装配动作收进可重入的 `start()`，监听 `loader/volatile-update` 后整体重装。密钥/归属索引留在 `start()` 之外，热改不应让已登录用户掉线。
 
 ## 代码规范
 

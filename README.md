@@ -27,32 +27,36 @@ npx @deepseek-ai/dsh plugin --profile web add <本插件目录>
 
 ## 配置
 
-在宿主 profile 的 `~/.dsh/settings.yaml` 中，以插件 id `cas` 为键声明配置：
+在宿主 profile 的插件 patch（本插件经 `cordis.patch.yml` 注册为条目 `id: cas`）上写 `config`：
 
 ```yaml
-cas:
-  cas:
-    serverUrl: "http://sso.example.com"
-    loginPath: "/login"
-    validatePath: "/validate"
-    logoutPath: "/logout"
-    servicePath: "/cas/callback"
-    srcsys: "dsh"
-    tlsRejectUnauthorized: true
-    adminUsernames: ["admin1", "admin2"]
-    endpoints:            # 可选：按客户端 IP 匹配多端点，首个匹配生效
-      - ipPattern: "10.251.%"
-        serverUrl: "http://sso-internal.example.com"
-  auth:
-    sessionTtlSeconds: 43200
-    cookieName: "dsh_cas_user"
-    cookieSameSite: "lax"
-    unownedSessions: "admin"   # admin | everyone | none
-    adminOnlyMethods: []       # 额外限定管理员的 /api 方法
-  enforce: true
+- id: cas
+  name: dsh-cas
+  config:
+    cas:
+      serverUrl: "http://sso.example.com"
+      loginPath: "/login"
+      validatePath: "/validate"
+      logoutPath: "/logout"
+      servicePath: "/cas/callback"
+      srcsys: "dsh"
+      tlsRejectUnauthorized: true
+      adminUsernames: ["admin1", "admin2"]
+      endpoints:            # 可选：按客户端 IP 匹配多端点，首个匹配生效
+        - ipPattern: "10.251.%"
+          serverUrl: "http://sso-internal.example.com"
+    auth:
+      sessionTtlSeconds: 43200
+      cookieName: "dsh_cas_user"
+      cookieSameSite: "lax"
+      unownedSessions: "admin"   # admin | everyone | none
+      adminOnlyMethods: []       # 额外限定管理员的 /api 方法
+    enforce: true
 ```
 
-`settings.yaml` 中的 `cas:` 段经 `ctx.settings` 命名空间注册读取（`src/index.ts` 的 `settings.register('cas', Config)`），合并 schemastery 默认值与外挂 patch 的 config 后作为插件配置；**改动后需重启宿主生效**。管理员在页面 CAS 配置面板保存的设置会落盘到 `$DSH_HOME/cas.yaml`（`store.ts`），页面配置优先于 `settings.yaml`。
+> **dsh 0.1.7 起**：插件配置不再读 `~/.dsh/settings.yaml`（该文件已被宿主删除并把各段并入对应条目），也不再走 `ctx.settings.register()` 命名空间。旧的 `settings.yaml` 会由宿主自动改名成 `settings.yaml.imported` 并把 `cas:` 段并入条目 `cas`。更简单的做法是直接在 **DSH 控制台 → 设置 → 插件 → dsh-cas** 里填——`Config` 的三个顶层字段都标了 `.volatile()`，会生成表单且**保存后热生效**（本插件监听 `loader/volatile-update` 重装路由，cookie 与归属索引不受影响）。也可用 `--dump-config` 看当前 profile 的实际条目。
+
+`config` 经 schemastery `Config` 校验（`src/config.ts`）后由 `readCasSettings()` 解包成普通值使用。管理员在页面 CAS 配置面板保存的设置会落盘到 `$DSH_HOME/cas.yaml`（`store.ts`），页面配置优先于条目 config。
 
 必填项：`cas.serverUrl` 或 `cas.endpoints` 至少其一。管理员角色由 `cas.adminUsernames` 中的 CAS 用户名（不区分大小写）映射得到。
 

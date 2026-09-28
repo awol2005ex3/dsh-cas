@@ -12,32 +12,39 @@
  * 把 `/api` 注册为 prefix，因此这里用 exact 注册具体方法即可接管。
  */
 
+// @dsh-version 0.1.7-rc.2
 import type { Context } from '@deepseek-ai/cordis'
 import { RevocationList } from './auth.js'
 import {
   BUILTIN_ADMIN_ONLY_METHODS,
   Config,
   ENV_SESSION_SECRET,
+  readCasSettings,
   readSessionSecret,
   resolveAuth,
   resolveCas,
   resolveDshHome,
   validateConfig,
+  type CasPluginConfig,
 } from './config.js'
 import { registerApiGate, type ConnectionFetchRoutes, type GatewayInvoke } from './gate.js'
 import { hijackEventUpgrades, wrapEventStreams, type EventsStreams } from './events-ws.js'
 import { registerCasRoutes, type RouteRegistrar } from './http.js'
 import { StateStore } from './store.js'
-import type { CasConfig, PluginConfig, ResolvedCasConfig } from './types.js'
+import type { CasConfig, PluginConfig, ResolvedAuthConfig, ResolvedCasConfig } from './types.js'
 
 /** 插件 id —— 在组合后的插件树中必须唯一。 */
 export const name = 'dsh-cas'
 
 /**
  * 声明依赖的宿主服务。webServer 是硬依赖（整套机制都建立在它的路由表上）；
- * apiProxy 用 `ctx.get` 取，避免它未就绪时把本插件挡在加载之外。
+ * apiProxy / connection / typertGateway 用 `ctx.get` + `ctx.inject` 取，避免它们
+ * 未就绪时把本插件挡在加载之外。
+ *
+ * 注意：dsh ≥ 0.1.7 已**没有** `ctx.settings.register()`，插件配置由 profile 条目
+ * `id: cas` 的 config 承载（见下方 apply 的说明），故此处不再声明 `settings`。
  */
-export const inject = ['webServer', 'settings']
+export const inject = ['webServer']
 
 export { Config }
 export type { PluginConfig }
@@ -45,51 +52,35 @@ export type { PluginConfig }
 /** 吊销表清扫间隔。 */
 const SWEEP_INTERVAL_MS = 10 * 60 * 1000
 
-/** `ctx.settings` 的窄化视图（只用到 register + scope.get）。 */
-interface SettingsLike {
-  register: (
-    ns: string,
-    schema: unknown,
-    options?: { applies?: 'live' | 'restart'; base?: object },
-  ) => { get: () => object }
-}
-
 /**
  * 插件入口（具名导出，禁止 export default —— 会丢失 inject 元数据）。
  *
- * 有效配置来源：`ctx.settings` 命名空间 `cas`（settings.yaml 中的 `cas:` 段，
- * 由 schemastery Config 校验并合并默认值）> 外挂 patch/CLI 传入的 config。
- * harness 不会把 settings.yaml 段自动折进 apply 的 config 参数，必须显式
- * 注册命名空间读取（此即 dsh-wecom 等第三方插件的标准做法）。
+ * 有效配置来源：**profile 条目 `id: cas` 上的 config**。dsh ≥ 0.1.7 起插件配置
+ * 不再走 `ctx.settings.register()` 命名空间（harness 已把旧的 `~/.dsh/settings.yaml`
+ * 的 `cas:` 段一次性并入该条目），`Config` 里标记 `.volatile()` 的字段解析后是稳定
+ * 引用：设置页改写时 loader 原地更新引用里的值、**不重挂插件**，只在本插件的 ctx
+ * 上广播 `loader/volatile-update`。
+ *
+ * 因此本入口把所有装配动作收进 `start()`，可整体撤销并重跑：首装、配置热改、
+ * 宿主服务迟到就绪三条路径共用它。cookie 签名密钥、归属索引、吊销表刻意留在
+ * `start()` 之外——配置热改不应让已登录用户的 cookie 失效。
+ *
+ * 无论字段是引用（新 dsh）还是普通值（旧 dsh / 测试替身），一律经
+ * `readCasSettings()` 解包成普通值再用。
  */
-export function apply(ctx: Context, config: PluginConfig): void {
+export function apply(ctx: Context, config: CasPluginConfig): void {
   const log = (message: string): void => { ctx.logger.warn(`dsh-cas: ${message}`) }
 
-  const settings = ctx.get('settings') as SettingsLike | undefined
-  let effectiveConfig = config
-  if (settings?.register !== undefined) {
-    try {
-      // base 用外挂 config，settings.yaml 的 `cas:` 段作为用户层叠加其上；
-      // applies: 'restart' 表明 namespace 变更需重启生效（登录态 cookie 也会随密钥变化重建）。
-      const scope = settings.register('cas', Config, { applies: 'restart', base: config })
-      effectiveConfig = scope.get() as unknown as PluginConfig
-    } catch (err) {
-      log(`settings 命名空间注册失败，回退 patch config：${String(err)}`)
-    }
-  }
+  // 长期存活的进程级状态。
+  const store = new StateStore(`${resolveDshHome()}/cas.yaml`)
+  store.load()
 
-  const validation = validateConfig(effectiveConfig)
-  if (!validation.valid) {
-    log(`配置不完整（${validation.reason}），以仅路由模式加载（可在设置页中补全）`)
-  }
-  const configValid = validation.valid
+  const secret = readSessionSecret()
+  const revocations = new RevocationList()
 
-  // 合并管理员专属方法与配置追加项。
-  const auth = resolveAuth({
-    ...effectiveConfig.auth,
-    adminOnlyMethods: [...BUILTIN_ADMIN_ONLY_METHODS, ...(effectiveConfig.auth?.adminOnlyMethods ?? [])],
-  })
-  const cas = resolveCas(effectiveConfig.cas, auth)
+  if (process.env[ENV_SESSION_SECRET] === undefined) {
+    log(`未设置 ${ENV_SESSION_SECRET}，已使用随机密钥：重启后需要重新登录`)
+  }
 
   const webServer = ctx.get('webServer') as {
     register: (route: {
@@ -108,114 +99,147 @@ export function apply(ctx: Context, config: PluginConfig): void {
     return
   }
 
-  const store = new StateStore(`${resolveDshHome()}/cas.yaml`)
-  store.load()
+  /* ── 可重装配的运行期服务 ── */
 
-  const secret = readSessionSecret()
-  const revocations = new RevocationList()
-
-  if (process.env[ENV_SESSION_SECRET] === undefined) {
-    log(`未设置 ${ENV_SESSION_SECRET}，已使用随机密钥：重启后需要重新登录`)
-  }
-
-  /* ── CAS 配置（页面保存优先于 profile 配置） ── */
-
-  const savedCas = store.getCas()
-  const currentCas: { value: ResolvedCasConfig } = {
-    value: savedCas === undefined ? cas : resolveCas(savedCas, auth),
-  }
-
-  const getCasConfig = (): CasConfig | undefined => store.getCas()
-  const setCasConfig = (newCas: CasConfig): void => {
-    store.setCas(newCas)
-    currentCas.value = resolveCas(newCas, auth)
-    log('CAS 配置已更新')
-  }
-
-  /* ── 路由注册 ── */
+  /** 迟到就绪的宿主服务，缓存起来供每一轮装配复用。 */
+  const deps: { connFetch?: ConnectionFetchRoutes; gateway?: GatewayInvoke } = {}
+  /** 当前这一轮装配的撤销函数；undefined 表示尚未装配。 */
+  let teardown: (() => void) | undefined
 
   const register: RouteRegistrar = route => webServer.register(route)
 
-  const disposeCasRoutes = registerCasRoutes({
-    config: effectiveConfig,
-    cas: currentCas.value,
-    auth,
-    secret,
-    getCasConfig,
-    setCasConfig,
-    track: (jti, userId, expiresAt) => revocations.track(jti, userId, expiresAt),
-    isRevoked: jti => revocations.has(jti),
-    revokeUser: userId => {
-      revocations.addUser(userId, Date.now() + auth.sessionTtlSeconds * 1000)
-    },
-    log,
-  }, register)
+  /**
+   * 按当前配置装配全部路由与包装器，替换上一轮。
+   *
+   * 幂等且可重入：首装、`loader/volatile-update`、宿主服务迟到就绪三条路径共用它。
+   * 所有注册（HTTP 路由、fetch 影子路由、upgrade 劫持、事件流包装）都登记进本轮
+   * disposer，重装 / fiber 卸载时整体回滚，不会出现「旧闭包残留 + 新闭包叠加」。
+   */
+  function start(): void {
+    teardown?.()
+    const disposers: (() => void)[] = []
+    teardown = () => {
+      for (const dispose of disposers.reverse()) {
+        try { dispose() } catch (err) { log(`撤销注册失败：${String(err)}`) }
+      }
+    }
 
-  ctx.effect(() => disposeCasRoutes, 'dsh-cas: routes')
+    const effectiveConfig = readCasSettings(config)
 
-  // 独立 CAS 登录跳转页（整页登录场景）。
-  try {
-    const disposeLoginPage = register({
-      kind: 'exact',
-      path: '/cas/login.html',
-      handler: (_req, res) => {
-        const response = res as { writeHead: (status: number, headers: Record<string, string>) => void; end: (body: string) => void }
-        response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
-        response.end(renderLoginPage())
-      },
+    const validation = validateConfig(effectiveConfig)
+    if (!validation.valid) {
+      log(`配置不完整（${validation.reason}），以仅路由模式加载（可在设置页中补全）`)
+    }
+
+    // 合并管理员专属方法与配置追加项。
+    const auth = resolveAuth({
+      ...effectiveConfig.auth,
+      adminOnlyMethods: [...BUILTIN_ADMIN_ONLY_METHODS, ...(effectiveConfig.auth?.adminOnlyMethods ?? [])],
     })
-    ctx.effect(() => disposeLoginPage, 'dsh-cas: login page')
-  } catch (err) {
-    log(`注册登录页失败：${String(err)}`)
-  }
 
-  if (effectiveConfig.enforce && configValid) {
-    // 广播等待 connection fetch 路由与 typert gateway 就绪后再接管 /api/session/*。
+    /* ── CAS 配置（页面保存优先于 profile 配置） ── */
+
+    const savedCas = store.getCas()
+    const currentCas: { value: ResolvedCasConfig } = {
+      value: resolveCas(savedCas ?? effectiveConfig.cas, auth),
+    }
+
+    const getCasConfig = (): CasConfig | undefined => store.getCas()
+    const setCasConfig = (newCas: CasConfig): void => {
+      store.setCas(newCas)
+      currentCas.value = resolveCas(newCas, auth)
+      log('CAS 配置已更新')
+    }
+
+    /* ── /cas/* 路由 ── */
+
+    disposers.push(registerCasRoutes({
+      config: effectiveConfig,
+      cas: currentCas.value,
+      auth,
+      secret,
+      getCasConfig,
+      setCasConfig,
+      track: (jti, userId, expiresAt) => revocations.track(jti, userId, expiresAt),
+      isRevoked: jti => revocations.has(jti),
+      revokeUser: userId => {
+        revocations.addUser(userId, Date.now() + auth.sessionTtlSeconds * 1000)
+      },
+      log,
+    }, register))
+
+    // 独立 CAS 登录跳转页（整页登录场景）。http.ts 已挂 /cas/login.html，
+    // 这里再兜一份整页遮罩（webServer 路由表被抢占时仍可用）。
+    try {
+      disposers.push(register({
+        kind: 'exact',
+        path: '/cas/login.html',
+        handler: (_req, res) => {
+          const response = res as { writeHead: (status: number, headers: Record<string, string>) => void; end: (body: string) => void }
+          response.writeHead(200, { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' })
+          response.end(renderLoginPage())
+        },
+      }))
+    } catch (err) {
+      log(`注册登录页失败：${String(err)}`)
+    }
+
+    if (!effectiveConfig.enforce || !validation.valid) {
+      if (effectiveConfig.enforce) log('CAS 配置不完整，仅提供登录路由（会话隔离未启用）')
+      else log('enforce=false，仅提供登录路由')
+      return
+    }
+
+    /* ── /api/session/* 影子路由（会话隔离） ── */
     // 旧架构的 `apiProxy` 已废弃（ctx.get('apiProxy') 恒为 undefined），改走
     // `connection.fetch.register` + `ctx.typertGateway.invoke`。
-    ctx.inject(['connection', 'typertGateway'], (injectedCtx) => {
-      const injected = injectedCtx as unknown as {
-        connection?: { fetch?: ConnectionFetchRoutes }
-        typertGateway?: GatewayInvoke
-      }
-      // harness 里 `ctx.connection` 是 HostConnectionHandle，含 `.rpc`/`.fetch`
-      // 两个 getter；exact 路由注册在 `ctx.connection.fetch.register`。
-      const connFetch = injected.connection?.fetch
-      const gateway = injected.typertGateway
-      if (connFetch === undefined || gateway === undefined) {
-        log('connection.fetch / typertGateway 未就绪，会话隔离未启用（CAS 登录仍可用）')
-        return
-      }
-      const gate = registerApiGate({
-        config: effectiveConfig,
-        auth,
-        store,
-        gateway,
-        isRevoked: jti => revocations.has(jti),
-        secret,
-        log,
-      }, connFetch)
-      ctx.effect(() => gate.dispose, 'dsh-cas: api gate')
-      log(`已接管 ${gate.methods.length} 个 /api/session/* 方法`)
-    })
+    if (deps.connFetch === undefined || deps.gateway === undefined) {
+      log('connection.fetch / typertGateway 尚未就绪，会话隔离待其就绪后启用')
+    } else {
+      mountApiGate(disposers, effectiveConfig, auth, deps.connFetch, deps.gateway)
+    }
 
     /* ── 实时事件流（WebSocket）隔离 ── */
     // 侧边栏由 events.mux / events.host 实时驱动，harness 全量广播，必须逐帧按
     // owner 过滤，否则切换 CAS 用户后仍能实时看到他人会话。
+    mountEventIsolation(disposers, auth)
+  }
+
+  /** 接管 `/api/session/*`：登录态校验 + 归属过滤/认领。 */
+  function mountApiGate(
+    disposers: (() => void)[],
+    effectiveConfig: PluginConfig,
+    auth: ResolvedAuthConfig,
+    connFetch: ConnectionFetchRoutes,
+    gateway: GatewayInvoke,
+  ): void {
+    const gate = registerApiGate({
+      config: effectiveConfig,
+      auth,
+      store,
+      gateway,
+      isRevoked: jti => revocations.has(jti),
+      secret,
+      log,
+    }, connFetch)
+    disposers.push(gate.dispose)
+    log(`已接管 ${gate.methods.length} 个 /api/session/* 方法`)
+  }
+
+  /** 拦截 WebSocket 升级并包装事件流上游，按登录态与归属逐帧过滤。 */
+  function mountEventIsolation(disposers: (() => void)[], auth: ResolvedAuthConfig): void {
     const filterCtx = { store, auth, log }
     const authView = { auth, secret, isRevoked: (jti: string) => revocations.has(jti) }
 
     // 升级拦截：webServer.server 未就绪时 hijackEventUpgrades 内部判空并跳过（打日志）。
-    const disposeHijack = hijackEventUpgrades(
+    disposers.push(hijackEventUpgrades(
       { ...filterCtx, authView },
       webServer as unknown as { server?: import('node:http').Server },
-    )
-    ctx.effect(() => disposeHijack, 'dsh-cas: websocket upgrades')
+    ))
 
     // 包装 apiProxy.events.*：必须在浏览器建连前安装（apply 时窗口期内无已登录连接）。
     const setupEvents = (events: EventsStreams): void => {
-      const dispose = wrapEventStreams(filterCtx, events)
-      ctx.effect(() => dispose, 'dsh-cas: event streams')
+      disposers.push(wrapEventStreams(filterCtx, events))
     }
     const apiProxyNow = ctx.get('apiProxy') as { events?: EventsStreams } | undefined
     if (apiProxyNow?.events !== undefined) {
@@ -234,9 +258,53 @@ export function apply(ctx: Context, config: PluginConfig): void {
     }
   }
 
-  // 登录遮罩：注入在 <body> 起始处，应用脚本之前。
+  /* ── 首装 ── */
+  start()
+
+  /*
+   * 配置热更新（dsh ≥ 0.1.7）。
+   *
+   * volatile-only 的配置改动**不重挂插件**：loader 把新值提交进运行中的 volatile
+   * 引用后，在本插件的 ctx 上广播 `loader/volatile-update`（见 cordis-plugin-loader
+   * 的 `Entry._commitVolatile`）。这里据此重读配置并整体重装路由——cookie 签名密钥
+   * 与归属索引不受影响，已登录用户不必重新登录。
+   *
+   * 事件名由 @deepseek-ai/cordis-plugin-loader 增补到 cordis 的 Events，本插件不
+   * 依赖该包，故用宽松调用避免类型耦合（运行时 `ctx.on` 接受任意事件名）；ctx.on 的
+   * 监听随 fiber 卸载自动反注册。改写若被 loader 判定为「普通配置变更」，插件会整体
+   * 重挂 —— 那时 apply 重新执行，同样会拿到新配置，两条路径都覆盖。
+   */
+  const onEvent = (ctx as unknown as {
+    on?: (event: string, listener: (...args: unknown[]) => void) => unknown
+  }).on
+  onEvent?.call(ctx, 'loader/volatile-update', () => {
+    log('配置已更新，正在重新装配路由')
+    start()
+  })
+
+  // connection.fetch / typertGateway 迟到就绪时补装一次会话隔离。
+  ctx.inject(['connection', 'typertGateway'], (injectedCtx) => {
+    const injected = injectedCtx as unknown as {
+      connection?: { fetch?: ConnectionFetchRoutes }
+      typertGateway?: GatewayInvoke
+    }
+    // harness 里 `ctx.connection` 是 HostConnectionHandle，含 `.rpc`/`.fetch`
+    // 两个 getter；exact 路由注册在 `ctx.connection.fetch.register`。
+    deps.connFetch = injected.connection?.fetch
+    deps.gateway = injected.typertGateway
+    if (deps.connFetch === undefined || deps.gateway === undefined) {
+      log('connection.fetch / typertGateway 不可用，会话隔离未启用（CAS 登录仍可用）')
+      return
+    }
+    start()
+  })
+
+  // 登录遮罩：注入在 <body> 起始处，应用脚本之前。与配置无关，整轮装配只挂一次。
   const disposeTap = webServer.tapIndex(html => injectGate(html))
   ctx.effect(() => disposeTap, 'dsh-cas: index tap')
+
+  // 整轮装配的兜底撤销：正常路径由 start() 自己接管上一轮，这里兜住 fiber 卸载。
+  ctx.effect(() => () => { teardown?.(); teardown = undefined }, 'dsh-cas: assembly')
 
   // 定期清理过期的吊销登记。
   const timer = setInterval(() => { revocations.sweep() }, SWEEP_INTERVAL_MS)

@@ -64,7 +64,7 @@ export const Config = Schema.object({
     maxResponseBytes: Schema.number().default(64 * 1024).description('ticket 验证响应的最大字节数。'),
     adminUsernames: Schema.array(Schema.string()).description('映射为管理员（admin）的 CAS 用户名列表。'),
     sessionTtlSeconds: Schema.number().description('CAS 登录态有效期（秒）；缺省用 auth.sessionTtlSeconds。'),
-  }).description('CAS 单点登录配置，页面可配置并落盘。'),
+  }).description('CAS 单点登录配置，页面可配置并落盘。').volatile(),
   auth: Schema.object({
     sessionTtlSeconds: Schema.number().default(60 * 60 * 12).description('登录态有效期（秒）。'),
     cookieName: Schema.string().default('dsh_cas_user').description('登录态 cookie 名。'),
@@ -73,9 +73,68 @@ export const Config = Schema.object({
       '未被认领的历史会话如何处置：admin 仅管理员可见，everyone 所有人可见，none 任何人都看不到。',
     ),
     adminOnlyMethods: Schema.array(Schema.string()).description('额外限定管理员才能调用的 /api 方法。'),
-  }).description('登录态与会话策略。'),
-  enforce: Schema.boolean().default(true).description('启用 /api 方法鉴权与会话隔离；关闭后仅提供 CAS 登录。'),
+  }).description('登录态与会话策略。').volatile(),
+  enforce: Schema.boolean().default(true).volatile().description('启用 /api 方法鉴权与会话隔离；关闭后仅提供 CAS 登录。'),
 })
+
+/* ── dsh ≥ 0.1.7 的配置载体 ── */
+
+/**
+ * 只依赖 `get()` 的结构类型。
+ *
+ * dsh ≥ 0.1.7 起插件配置不再是 `ctx.settings.register()` 的命名空间，而是
+ * 「插件 Config + profile 条目 config」；标记 `.volatile()` 的字段在解析后是
+ * cosmokit 的 `Volatile<T>` **稳定引用**（设置页改写时 loader 原地更新引用里的值、
+ * 不重挂插件）。这里只声明用得到的 `get()`，让旧版 dsh（字段是普通值）与测试
+ * 替身同样通过类型检查。
+ */
+export interface VolatileRef<T> {
+  get(): T
+}
+
+/** 字段可能是 volatile 引用（dsh ≥ 0.1.7）或普通值（旧版 dsh / 测试替身）。 */
+export type MaybeVolatile<T> = T | VolatileRef<T>
+
+/**
+ * `Config` schema 的解析结果：每个顶层字段都可能是 volatile 引用。
+ *
+ * ⚠ 不要直接对它做业务判断——一律经 {@link readCasSettings} 解包成普通值。
+ */
+export interface CasPluginConfig {
+  cas?: MaybeVolatile<CasConfig>
+  auth?: MaybeVolatile<Partial<AuthConfig>>
+  enforce: MaybeVolatile<boolean>
+}
+
+/** 解包 volatile 引用（dsh ≥ 0.1.7）或普通值（旧版 dsh / 测试替身）。 */
+export function unwrap<T>(value: MaybeVolatile<T> | undefined | null): T | undefined {
+  if (value === undefined || value === null) return undefined
+  const ref = value as VolatileRef<T>
+  if (typeof ref.get === 'function') {
+    try {
+      return ref.get()
+    } catch {
+      // 引用被替换/尚未提交时不致命：退回缺省值，插件照旧按已提交的配置运行。
+      return undefined
+    }
+  }
+  return value as T
+}
+
+/**
+ * 取一份**普通值**配置快照。
+ *
+ * volatile 字段的引用不变、值在变，因此每次启停服务前都要现读现用，不能在
+ * apply 时缓存结果。
+ */
+export function readCasSettings(config?: CasPluginConfig | null): PluginConfig {
+  const source: CasPluginConfig = config ?? { enforce: true }
+  return {
+    cas: unwrap(source.cas),
+    auth: unwrap(source.auth),
+    enforce: unwrap(source.enforce) ?? true,
+  }
+}
 
 /** 鉴权设置的默认值（config 里 auth 为 Partial）。 */
 export const DEFAULT_AUTH: ResolvedAuthConfig = {
